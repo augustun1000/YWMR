@@ -1,5 +1,5 @@
-This version incorporates the selection of the CRTC associated with eDP-1, session management with libseat, and a display test using drmModeSetCrtc(). Device access and session notifications follow the libseat interface.
-
+Now Double buffering and synchronization with the monitor's 60 Hz: While KMS displays buffer A, Pixman draws in buffer B. We then request to switch to B and wait for kernel confirmation before reusing A.
+The response time should be approximately 16.665 ms.
 The program will attempt to display the same rectangles we drew with Pixman for three seconds and then restore the previous mode.
 #In tty
 cargo --release build &

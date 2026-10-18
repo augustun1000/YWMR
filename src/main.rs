@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,11 @@ const PIXMAN_OP_SRC: c_int = 1;
 const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_SHARED: c_int = 1;
+const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+const POLLIN: i16 = 0x0001;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const FLIPS: usize = 120;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -87,7 +92,10 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
 }
+#[repr(C)]
+struct PollFd { fd: c_int, events: i16, revents: i16 }
 extern "C" fn request_stop(_: c_int) { STOP_REQUESTED.store(true, Ordering::SeqCst); }
 
 struct DrmDevice<'a> { seat: &'a Seat, fd: RawFd, device_id: c_int }
@@ -169,6 +177,69 @@ unsafe extern "C" {
         handles: *const u32, pitches: *const u32, offsets: *const u32,
         buf_id: *mut u32, flags: u32) -> c_int;
     fn drmModeRmFB(fd: c_int, id: u32) -> c_int;
+    fn drmModePageFlip(fd: c_int, crtc_id: u32, fb_id: u32,
+        flags: u32, user_data: *mut c_void) -> c_int;
+    fn drmHandleEvent(fd: c_int, context: *mut DrmEventContext) -> c_int;
+}
+
+// libdrm event context ABI (versión 2). Evitamos handlers nuevos
+// porque la estructura debe corresponder exactamente a su versión.
+type DrmEventHandler = unsafe extern "C" fn(c_int, u32, u32, u32, *mut c_void);
+#[repr(C)]
+struct DrmEventContext {
+    version: c_int,
+    vblank_handler: Option<DrmEventHandler>,
+    page_flip_handler: Option<DrmEventHandler>,
+}
+struct FlipState {
+    completed: AtomicBool,
+    sequence: AtomicU32,
+    timestamp_us: AtomicU64,
+}
+unsafe extern "C" fn on_page_flip(
+    _fd: c_int, sequence: u32, sec: u32, usec: u32, data: *mut c_void,
+) {
+    if data.is_null() { return; }
+    let state = unsafe { &*(data as *const FlipState) };
+    state.sequence.store(sequence, Ordering::SeqCst);
+    state.timestamp_us.store(u64::from(sec) * 1_000_000 + u64::from(usec), Ordering::SeqCst);
+    state.completed.store(true, Ordering::SeqCst);
+}
+
+// Este bucle atiende tanto la sesión como el evento KMS. Una petición Ctrl+C
+// durante un flip NO interrumpe la espera: el buffer debe mantenerse vivo
+// hasta el callback del kernel.
+fn wait_flip(fd: RawFd, seat: &Seat, state: &FlipState) -> io::Result<()> {
+    let mut context = DrmEventContext {
+        version: 2,
+        vblank_handler: None,
+        page_flip_handler: Some(on_page_flip),
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        seat.dispatch()?;
+        if !seat.active() { return Err(io::Error::other("La sesión perdió DRM durante un page flip")); }
+        if state.completed.load(Ordering::SeqCst) { return Ok(()); }
+        if Instant::now() > deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,
+                "El kernel no notificó el page flip en 3 segundos"));
+        }
+        let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
+        let polled = unsafe { poll(&mut pfd, 1, 25) };
+        if polled < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(e);
+        }
+        if polled == 0 { continue; }
+        if (pfd.revents & (POLLERR | POLLHUP)) != 0 {
+            return Err(io::Error::other("Error o cierre del dispositivo DRM"));
+        }
+        if (pfd.revents & POLLIN) != 0 {
+            let r = unsafe { drmHandleEvent(fd, &mut context) };
+            if r != 0 { return Err(drm_error("drmHandleEvent", r)); }
+        }
+    }
 }
 
 fn drm_error(name: &str, code: c_int) -> io::Error {
@@ -359,13 +430,16 @@ fn box_fill(image: *mut PixmanImage, (x1,y1,x2,y2): (i32,i32,i32,i32), c: Pixman
     }
     Ok(())
 }
-fn draw(buf: &DumbBuffer) -> io::Result<()> {
+fn draw(buf: &DumbBuffer, frame: usize) -> io::Result<()> {
     let p = unsafe { pixman_image_create_bits(PIXMAN_X8R8G8B8,
         buf.width as c_int, buf.height as c_int, buf.map.cast::<u32>(), buf.pitch as c_int) };
     if p.is_null() { return Err(io::Error::other("pixman_image_create_bits falló")); }
     let result = (|| {
         box_fill(p, (0, 0, buf.width as i32, buf.height as i32), color(22,38,56))?;
-        box_fill(p, (100,80,780,480), color(14,116,144))?;
+        // Barra que se mueve 8 píxeles por frame; el fondo se borra
+        // completamente en cada imagen de esta etapa experimental.
+        let x = ((frame * 8) % ((buf.width as usize) - 200)) as i32;
+        box_fill(p, (x, 100, x + 200, 490), color(14,116,144))?;
         box_fill(p, (400,250,920,550), color(245,158,11))?;
         Ok(())
     })();
@@ -431,43 +505,105 @@ fn show(path: &str) -> io::Result<()> {
     if cap == 0 { return Err(io::Error::other("GPU sin soporte dumb buffer")); }
     let output = select_output(fd)?;
     let saved = SavedCrtc::capture(fd, output.crtc_id)?;
-    eprintln!("eDP-1 (ID {CONNECTOR_ID}) en CRTC {}: {}x{} @ {} Hz",
+    eprintln!("eDP-1 (conector {CONNECTOR_ID}) CRTC {}: {}x{} @ {} Hz",
         output.crtc_id, output.mode.hdisplay, output.mode.vdisplay, output.mode.vrefresh);
-    eprintln!("Estado previo: framebuffer={}, {} conectores", saved.fb_id, saved.connectors.len());
-    let buffer = DumbBuffer::create(fd, output.mode.hdisplay.into(), output.mode.vdisplay.into())?;
-    draw(&buffer)?;
-    let fb = Framebuffer::new(fd, &buffer)?;
-    eprintln!("Dumb buffer: {} bytes | pitch={} | framebuffer KMS={}", buffer.len, buffer.pitch, fb.id);
-    eprintln!("Mostrando la imagen durante 3 segundos. Ctrl+C solicita una salida ordenada.");
+
+    let w = u32::from(output.mode.hdisplay);
+    let h = u32::from(output.mode.vdisplay);
+    let a = DumbBuffer::create(fd, w, h)?;
+    let b = DumbBuffer::create(fd, w, h)?;
+    draw(&a, 0)?;
+    draw(&b, 1)?;
+    let fb_a = Framebuffer::new(fd, &a)?;
+    let fb_b = Framebuffer::new(fd, &b)?;
+    eprintln!("Buffers independientes: {} y {} ({} bytes cada uno)",
+        fb_a.id, fb_b.id, a.len);
+
     let mut guard = RestoreGuard::new(&seat, fd, saved);
-    guard.present(fb.id, &output.mode)?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && !STOP_REQUESTED.load(Ordering::SeqCst) {
-        seat.dispatch()?;
-        if !seat.active() { break; }
-        thread::sleep(Duration::from_millis(20));
+    guard.present(fb_a.id, &output.mode)?;
+    // El framebuffer A está visible. B está disponible para dibujo.
+    let buffers = [&a, &b];
+    let ids = [fb_a.id, fb_b.id];
+    let mut showing = 0usize;
+    let mut flip_state = Box::new(FlipState {
+        completed: AtomicBool::new(false),
+        sequence: AtomicU32::new(0),
+        timestamp_us: AtomicU64::new(0),
+    });
+    let user_data = (&mut *flip_state as *mut FlipState).cast::<c_void>();
+    let mut prev_timestamp_us: Option<u64> = None;
+    let mut sum_delta_us = 0u64;
+    let mut measured_intervals = 0usize;
+    let started = Instant::now();
+    let mut successful_flips = 0usize;
+    eprintln!("Realizando hasta {FLIPS} page flips; Ctrl+C solicita detener tras el flip pendiente.");
+
+    let flips_result = (|| -> io::Result<()> {
+        for frame in 1..=FLIPS {
+            seat.dispatch()?;
+            if !seat.active() || STOP_REQUESTED.load(Ordering::SeqCst) { break; }
+            let next = showing ^ 1;
+            // No se modifica el buffer que todavía está en pantalla.
+            draw(buffers[next], frame)?;
+            flip_state.completed.store(false, Ordering::SeqCst);
+            let ret = unsafe { drmModePageFlip(fd, output.crtc_id, ids[next],
+                DRM_MODE_PAGE_FLIP_EVENT, user_data) };
+            if ret != 0 { return Err(drm_error("drmModePageFlip", ret)); }
+            // IMPORTANTE: esperamos el evento antes de intercambiar los índices.
+            wait_flip(fd, &seat, &flip_state)?;
+            showing = next;
+            successful_flips += 1;
+            let ts = flip_state.timestamp_us.load(Ordering::SeqCst);
+            if let Some(prev) = prev_timestamp_us {
+                if ts > prev { sum_delta_us += ts - prev; measured_intervals += 1; }
+            }
+            prev_timestamp_us = Some(ts);
+            if frame % 30 == 0 {
+                eprintln!("Flip {:3}: framebuffer={} secuencia={}",
+                    frame, ids[showing], flip_state.sequence.load(Ordering::SeqCst));
+            }
+        }
+        Ok(())
+    })();
+
+    eprintln!("Flips completados: {} | Duración de la prueba: {:.3} s",
+        successful_flips, started.elapsed().as_secs_f64());
+    if measured_intervals > 0 {
+        let avg_ms = (sum_delta_us as f64 / measured_intervals as f64) / 1000.0;
+        eprintln!("Separación media entre eventos KMS: {:.3} ms ({:.2} Hz)",
+            avg_ms, 1000.0 / avg_ms);
     }
+    // Si falló la espera del flip, es posible que aún haya uno pendiente.
+    // Intentamos restaurar solamente si conservamos el control del seat.
+    // Los buffers y el puntero al callback permanecen vivos hasta cerrar DRM.
     if seat.active() {
-        guard.restore()?;
-        eprintln!("Pantalla anterior restaurada. FB temporal retirado al salir.");
+        if let Err(e) = guard.restore() {
+            eprintln!("ADVERTENCIA: fallo al restaurar el CRTC: {e}");
+            if flips_result.is_ok() { return Err(e); }
+        } else {
+            eprintln!("Modo anterior restaurado.");
+        }
     } else {
-        eprintln!("La sesión perdió el control; no se intentará modeset fuera de la sesión activa.");
+        eprintln!("Sesión inactiva: no se intenta un modeset fuera de su sesión.");
     }
-    // Importante: guard -> framebuffer -> dumb buffer -> device -> seat.
+    // Nota: drop ordenado y explícito; el fd se cierra tras destruir los fb.
     drop(guard);
-    drop(fb);
-    drop(buffer);
+    drop(fb_b);
+    drop(fb_a);
+    drop(b);
+    drop(a);
+    drop(flip_state);
     drop(dev);
     drop(seat);
-    Ok(())
+    flips_result
 }
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1] != "--show" {
-        eprintln!("DRM-05: primera imagen en pantalla mediante DRM/KMS + Pixman + libseat");
-        eprintln!("Por seguridad, no se realiza ningún modeset sin --show.");
-        eprintln!("Uso (desde TTY real): {} --show /dev/dri/card1", args[0]);
+        eprintln!("DRM-06: doble buffering Pixman + page flips DRM/KMS + libseat");
+        eprintln!("Sin --show no se modifica la pantalla.");
+        eprintln!("Uso desde TTY Linux: {} --show /dev/dri/card1", args[0]);
         return Ok(());
     }
     let path = args.get(2).map(String::as_str).unwrap_or("/dev/dri/card1");
