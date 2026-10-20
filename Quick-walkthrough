@@ -1,6 +1,6 @@
-Now Double buffering and synchronization with the monitor's 60 Hz: While KMS displays buffer A, Pixman draws in buffer B. We then request to switch to B and wait for kernel confirmation before reusing A.
-The response time should be approximately 16.665 ms.
-The program will attempt to display the same rectangles we drew with Pixman for three seconds and then restore the previous mode.
+The entire screen is no longer cleared for every frame. Each buffer keeps track of the last frame it contains (`buffer_frames[0]` or `[1]`), as the two buffers alternate, with each one lagging one frame behind what is currently visible. To draw the new frame, the system calculates two rectangles: the bar’s previous position—within that same buffer—and its current position. If these rectangles overlap, they are merged; if the bar jumps from one edge to the other, they remain separate. The background, the bar, and any static rectangles are then redrawn only within those specific areas.
 #In tty
-cargo --release build &
-./drm-05 --show /dev/dri/card1
+sudo pacman -S --needed rust cargo libdrm pixman seatd pkgconf
+RUSTFLAGS='-C target-cpu=native' cargo test
+RUSTFLAGS='-C target-cpu=native' cargo build --release
+./target/release/drm-07 --show /dev/dri/card1

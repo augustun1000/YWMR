@@ -430,21 +430,158 @@ fn box_fill(image: *mut PixmanImage, (x1,y1,x2,y2): (i32,i32,i32,i32), c: Pixman
     }
     Ok(())
 }
-fn draw(buf: &DumbBuffer, frame: usize) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rect { x1: i32, y1: i32, x2: i32, y2: i32 }
+impl Rect {
+    fn full(w: u32, h: u32) -> Self {
+        Self { x1: 0, y1: 0, x2: w as i32, y2: h as i32 }
+    }
+    fn area(self) -> u64 {
+        ((self.x2-self.x1).max(0) as u64) * ((self.y2-self.y1).max(0) as u64)
+    }
+    fn intersection(self, b: Self) -> Option<Self> {
+        let r = Self {
+            x1: self.x1.max(b.x1), y1: self.y1.max(b.y1),
+            x2: self.x2.min(b.x2), y2: self.y2.min(b.y2),
+        };
+        (r.x1 < r.x2 && r.y1 < r.y2).then_some(r)
+    }
+    fn union(self, b: Self) -> Self {
+        Self {
+            x1: self.x1.min(b.x1), y1: self.y1.min(b.y1),
+            x2: self.x2.max(b.x2), y2: self.y2.max(b.y2),
+        }
+    }
+    fn coords(self) -> (i32,i32,i32,i32) {
+        (self.x1, self.y1, self.x2, self.y2)
+    }
+}
+
+fn bar_rect(width: u32, frame: usize) -> Rect {
+    // El programa exige 1366x768, por lo que el recorrido es positivo.
+    let travel = (width as usize).saturating_sub(200).max(1);
+    let x = (frame.wrapping_mul(8) % travel) as i32;
+    Rect { x1: x, y1: 100, x2: x + 200, y2: 490 }
+}
+
+fn damage_rects(width: u32, height: u32, frame: usize, previous: Option<usize>) -> Vec<Rect> {
+    let screen = Rect::full(width, height);
+    let current = bar_rect(width, frame);
+    match previous {
+        None => vec![screen],
+        Some(old_frame) => {
+            let old = bar_rect(width, old_frame);
+            if old == current { return vec![]; }
+            // Si los rectángulos se solapan, una envolvente pequeña reduce
+            // las llamadas a Pixman. En el salto al borde evitamos una gran
+            // envolvente y procesamos cada extremo por separado.
+            if old.intersection(current).is_some() {
+                vec![old.union(current).intersection(screen).unwrap()]
+            } else {
+                [old, current].into_iter()
+                    .filter_map(|r| r.intersection(screen)).collect()
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct DrawStats {
+    pixels: u64,
+    rects: usize,
+    elapsed: Duration,
+}
+
+fn render_scene(
+    image: *mut PixmanImage, width: u32, height: u32,
+    frame: usize, previous: Option<usize>,
+) -> io::Result<DrawStats> {
+    let began = Instant::now();
+    let damage = damage_rects(width, height, frame, previous);
+    let current = bar_rect(width, frame);
+    let fixed = Rect { x1: 400, y1: 250, x2: 920, y2: 550 };
+    let mut pixels = 0u64;
+    for r in &damage {
+        pixels += r.area();
+        // Redibujamos la escena respetando el orden de capas original:
+        // fondo -> franja turquesa -> rectángulo naranja.
+        box_fill(image, r.coords(), color(22,38,56))?;
+        if let Some(i) = r.intersection(current) {
+            box_fill(image, i.coords(), color(14,116,144))?;
+        }
+        if let Some(i) = r.intersection(fixed) {
+            box_fill(image, i.coords(), color(245,158,11))?;
+        }
+    }
+    Ok(DrawStats { pixels, rects: damage.len(), elapsed: began.elapsed() })
+}
+
+fn draw(buf: &DumbBuffer, frame: usize, previous: Option<usize>) -> io::Result<DrawStats> {
     let p = unsafe { pixman_image_create_bits(PIXMAN_X8R8G8B8,
         buf.width as c_int, buf.height as c_int, buf.map.cast::<u32>(), buf.pitch as c_int) };
     if p.is_null() { return Err(io::Error::other("pixman_image_create_bits falló")); }
-    let result = (|| {
-        box_fill(p, (0, 0, buf.width as i32, buf.height as i32), color(22,38,56))?;
-        // Barra que se mueve 8 píxeles por frame; el fondo se borra
-        // completamente en cada imagen de esta etapa experimental.
-        let x = ((frame * 8) % ((buf.width as usize) - 200)) as i32;
-        box_fill(p, (x, 100, x + 200, 490), color(14,116,144))?;
-        box_fill(p, (400,250,920,550), color(245,158,11))?;
-        Ok(())
-    })();
+    let result = render_scene(p, buf.width, buf.height, frame, previous);
     unsafe { pixman_image_unref(p); }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Sin DRM: dibujamos sobre memoria RAM convencional, con Pixman, y
+    // comparamos byte a byte el resultado incremental con el frame completo.
+    fn draw_ram(data: &mut [u32], w: u32, h: u32, frame: usize, prev: Option<usize>) {
+        let img = unsafe { pixman_image_create_bits(
+            PIXMAN_X8R8G8B8, w as c_int, h as c_int, data.as_mut_ptr(), (w*4) as c_int,
+        ) };
+        assert!(!img.is_null());
+        render_scene(img, w, h, frame, prev).unwrap();
+        unsafe { pixman_image_unref(img); }
+    }
+
+    #[test]
+    fn damage_produce_la_misma_imagen_que_un_redibujado_total() {
+        let (w,h)=(1366u32,768u32);
+        let count=(w*h) as usize;
+        let mut incremental=vec![0u32;count];
+        let mut full=vec![0u32;count];
+        draw_ram(&mut incremental,w,h,0,None);
+        let mut last=0usize;
+        // Incluye saltos, intersecciones con el rectángulo fijo y wraparound.
+        for frame in [2,4,8,20,50,75,100,145,146,147,148,200,290,450,582,583,584] {
+            draw_ram(&mut incremental,w,h,frame,Some(last));
+            draw_ram(&mut full,w,h,frame,None);
+            assert_eq!(incremental,full,"Diferencia en frame {frame}");
+            last=frame;
+        }
+    }
+
+    #[test]
+    fn ambos_buffers_alternados_son_correctos() {
+        let (w,h) = (1366u32,768u32);
+        let count=(w*h) as usize;
+        let mut buffers=[vec![0u32;count],vec![0u32;count]];
+        let mut last=[0usize,0usize];
+        for b in &mut buffers { draw_ram(b,w,h,0,None); }
+        let mut expected=vec![0u32;count];
+        for frame in 1..=40usize {
+            let target=frame % 2; // A comienza visible (0); B recibe frame 1.
+            draw_ram(&mut buffers[target],w,h,frame,Some(last[target]));
+            last[target]=frame;
+            draw_ram(&mut expected,w,h,frame,None);
+            assert_eq!(buffers[target],expected,"Buffer {target}, frame {frame}");
+        }
+    }
+
+    #[test]
+    fn ahorra_area_y_no_redibuja_sin_cambios() {
+        let full = 1366u64*768;
+        let damage = damage_rects(1366,768,2,Some(0));
+        let pixels: u64=damage.iter().map(|r|r.area()).sum();
+        assert!(pixels > 0 && pixels < full/5);
+        assert!(damage_rects(1366,768,2,Some(2)).is_empty());
+    }
 }
 
 struct RestoreGuard<'a> { seat: &'a Seat, fd: RawFd, saved: SavedCrtc, showing: bool }
@@ -512,8 +649,8 @@ fn show(path: &str) -> io::Result<()> {
     let h = u32::from(output.mode.vdisplay);
     let a = DumbBuffer::create(fd, w, h)?;
     let b = DumbBuffer::create(fd, w, h)?;
-    draw(&a, 0)?;
-    draw(&b, 1)?;
+    draw(&a, 0, None)?;
+    draw(&b, 0, None)?;
     let fb_a = Framebuffer::new(fd, &a)?;
     let fb_b = Framebuffer::new(fd, &b)?;
     eprintln!("Buffers independientes: {} y {} ({} bytes cada uno)",
@@ -525,6 +662,10 @@ fn show(path: &str) -> io::Result<()> {
     let buffers = [&a, &b];
     let ids = [fb_a.id, fb_b.id];
     let mut showing = 0usize;
+    let mut buffer_frames = [Some(0usize), Some(0usize)];
+    let mut total_damage_pixels = 0u64;
+    let mut total_render_ns = 0u128;
+    let mut total_damage_rects = 0usize;
     let mut flip_state = Box::new(FlipState {
         completed: AtomicBool::new(false),
         sequence: AtomicU32::new(0),
@@ -544,7 +685,11 @@ fn show(path: &str) -> io::Result<()> {
             if !seat.active() || STOP_REQUESTED.load(Ordering::SeqCst) { break; }
             let next = showing ^ 1;
             // No se modifica el buffer que todavía está en pantalla.
-            draw(buffers[next], frame)?;
+            let stats = draw(buffers[next], frame, buffer_frames[next])?;
+            buffer_frames[next] = Some(frame);
+            total_damage_pixels += stats.pixels;
+            total_damage_rects += stats.rects;
+            total_render_ns += stats.elapsed.as_nanos();
             flip_state.completed.store(false, Ordering::SeqCst);
             let ret = unsafe { drmModePageFlip(fd, output.crtc_id, ids[next],
                 DRM_MODE_PAGE_FLIP_EVENT, user_data) };
@@ -559,8 +704,9 @@ fn show(path: &str) -> io::Result<()> {
             }
             prev_timestamp_us = Some(ts);
             if frame % 30 == 0 {
-                eprintln!("Flip {:3}: framebuffer={} secuencia={}",
-                    frame, ids[showing], flip_state.sequence.load(Ordering::SeqCst));
+                eprintln!("Flip {:3}: framebuffer={} secuencia={} | daño: {} rect(s), {} píxeles | render: {:.3} ms",
+                    frame, ids[showing], flip_state.sequence.load(Ordering::SeqCst),
+                    stats.rects, stats.pixels, stats.elapsed.as_secs_f64()*1000.0);
             }
         }
         Ok(())
@@ -572,6 +718,13 @@ fn show(path: &str) -> io::Result<()> {
         let avg_ms = (sum_delta_us as f64 / measured_intervals as f64) / 1000.0;
         eprintln!("Separación media entre eventos KMS: {:.3} ms ({:.2} Hz)",
             avg_ms, 1000.0 / avg_ms);
+    }
+    if successful_flips > 0 {
+        let baseline = u64::from(w) * u64::from(h) * successful_flips as u64;
+        eprintln!("Daño total: {} píxeles / {} (pantallas completas); {:.1}% menos superficie por redibujar",
+            total_damage_pixels, baseline, 100.0 * (1.0 - total_damage_pixels as f64 / baseline as f64));
+        eprintln!("Rectángulos de daño: {} | tiempo medio dibujando con Pixman: {:.3} ms/frame",
+            total_damage_rects, total_render_ns as f64 / successful_flips as f64 / 1_000_000.0);
     }
     // Si falló la espera del flip, es posible que aún haya uno pendiente.
     // Intentamos restaurar solamente si conservamos el control del seat.
@@ -601,7 +754,7 @@ fn show(path: &str) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1] != "--show" {
-        eprintln!("DRM-06: doble buffering Pixman + page flips DRM/KMS + libseat");
+        eprintln!("DRM-07: damage tracking por buffer + Pixman + page flips DRM/KMS + libseat");
         eprintln!("Sin --show no se modifica la pantalla.");
         eprintln!("Uso desde TTY Linux: {} --show /dev/dri/card1", args[0]);
         return Ok(());
